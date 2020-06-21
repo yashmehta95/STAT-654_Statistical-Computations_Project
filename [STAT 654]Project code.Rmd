@@ -1,0 +1,384 @@
+---
+title: 'Improved NBA scoring model'
+output: 
+  pdf_document:
+    toc: true
+    number_sections: false
+    latex_engine: xelatex
+---
+
+# 1. Data redefinition
+
+### 1.1 Install and apply the desired packages for the project
+```{r,warning=FALSE,message=FALSE,error=FALSE}
+install.packages('stringr')
+install.packages('data.table')
+library(dplyr)
+library(data.table)
+library(stringr)
+```
+
+### 1.2 Data preparation
+```{r}
+# Data splitting
+nba <- as.data.frame(fread("nba_cleaned.txt"))
+team_names <- unique(c(nba$team1_name,nba$team2_name))
+n_team <- length(team_names)
+nba$home_game <- ifelse(str_detect(nba$team1_name,nba$location),nba$home_game <- 1,nba$home_game <- 0)
+set.seed(1234)
+ran <- sample(c(TRUE,FALSE), size = nrow(nba), replace = TRUE, prob = c(0.8,0.2))
+train_nba <- nba[ran,]
+test_nba1 <- nba[!ran,]
+train_nba_home <- train_nba[which(train_nba$home_game == "1"),]
+train_nba_away <- train_nba[which(train_nba$home_game == "0"),]
+test_nba_home <- test_nba1[which(test_nba1$home_game == "1"),]
+test_nba_away <- test_nba1[which(test_nba1$home_game == "0"),]
+
+T <- matrix(0, nrow = n_team, ncol = n_team, dimnames = list(team_names, team_names))
+P <- matrix(0, nrow = n_team, ncol = n_team, dimnames = list(team_names, team_names))
+T_home <- matrix(0, nrow = n_team, ncol = n_team, dimnames = list(team_names, team_names))
+P_home <- matrix(0, nrow = n_team, ncol = n_team, dimnames = list(team_names, team_names))
+T_away <- matrix(0, nrow = n_team, ncol = n_team, dimnames = list(team_names, team_names))
+P_away <- matrix(0, nrow = n_team, ncol = n_team, dimnames = list(team_names, team_names))
+
+# Data preparation for original model
+for(i in 1:nrow(T)){
+    out <- subset(train_nba,team1_name==rownames(T)[i],select=c("team2_name","team1_score","team2_score","game_length"))
+    mins <- tapply(out[,4],out[,1],sum)
+    ps <- tapply(out[,2],out[,1],sum)
+    pg <- tapply(out[,3],out[,1],sum)
+    T[i,names(mins)] <- mins
+    P[i,names(ps)] <- P[i,names(ps)] + ps
+    P[names(ps),i] <- P[names(ps),i] + pg
+}
+T <- T + t(T) 
+Prs <- rowSums(P)
+Pcs <- colSums(P)
+
+# Data preparation for home game
+for(i in 1:nrow(T_home)){
+    out1 <- subset(train_nba_home,team1_name==rownames(T_home)[i],select=c("team2_name","team1_score","team2_score","game_length"))
+    mins <- tapply(out1[,4],out1[,1],sum)
+    ps <- tapply(out1[,2],out1[,1],sum)
+    pg <- tapply(out1[,3],out1[,1],sum)
+    T_home[i,names(mins)] <- mins
+    P_home[i,names(ps)] <- P_home[i,names(ps)] + ps
+    P_home[names(ps),i] <- P_home[names(ps),i] + pg
+}
+T_home <- T_home + t(T_home) 
+Prs_home <- rowSums(P_home) 
+Pcs_home <- colSums(P_home)
+
+# Data preparation for away game
+for(i in 1:nrow(T_away)){
+    out2 <- subset(train_nba_away,team1_name==rownames(T_away)[i],select=c("team2_name","team1_score","team2_score","game_length"))
+    mins <- tapply(out2[,4],out2[,1],sum)
+    ps <- tapply(out2[,2],out2[,1],sum) ## team1 score summation
+    pg <- tapply(out2[,3],out2[,1],sum) ## team2 score summation
+    T_away[i,names(mins)] <- mins
+    P_away[i,names(ps)] <- P_away[i,names(ps)] + ps 
+    P_away[names(ps),i] <- P_away[names(ps),i] + pg
+}
+T_away <- T_away + t(T_away) 
+Prs_away <- rowSums(P_away) # what the team get
+Pcs_away <- colSums(P_away) # what the team concede
+```
+
+
+
+# 2. Upgraded O/D Model
+
+### 2.0 Optimize the parameters for the original model by using Block relaxation
+```{r}
+od_original <- matrix(0,nrow=n_team,ncol=2)
+colnames(od_original) <- c("o","d")
+rownames(od_original) <- colnames(T)
+N <- 100
+for(j in 1:N){
+    od_original[,2] <- -log(Pcs / colSums(T*exp(od_original[,1])))
+    od_original[,2] <- od_original[,2] - od_original[1,2]
+    od_original[,1] <- log(Prs / colSums(t(T)*exp(-od_original[,2])))
+}
+od_original <- od_original - mean(od_original)
+mean_length <- mean(train_nba$game_length)
+```
+
+### 2.1 Optimize the parameters for home position by using Block relaxation
+```{r}
+od_home <- matrix(0,nrow=n_team,ncol=2)
+colnames(od_home) <- c("o","d")
+rownames(od_home) <- colnames(T_home)
+
+# Iterations
+Niter <- 10000
+for(j in 1:Niter){
+    od_home[,2] <- -log(Pcs_home / colSums(T_home*exp(od_home[,1])))
+    od_home[,2] <- od_home[,2] - od_home[1,2]
+    od_home[,1] <- log(Prs_home / colSums(t(T_home)*exp(-od_home[,2])))
+}
+
+# Normalize od to 0
+od_home <- od_home - mean(od_home)
+```
+
+### 2.2 Optimize the parameters for away position(by using Block relaxation)
+```{r}
+od_away <- matrix(0,nrow=n_team,ncol=2)
+colnames(od_away) <- c("o","d")
+rownames(od_away) <- colnames(T_away)
+
+# Iterations
+Niter <- 10000
+for(j in 1:Niter){
+    od_away[,2] <- -log(Pcs_away / colSums(T_away*exp(od_away[,1])))
+    od_away[,2] <- od_away[,2] - od_away[1,2]
+    od_away[,1] <- log(Prs_away / colSums(t(T_away)*exp(-od_away[,2])))
+}
+
+# Normalize od to 0
+od_away <- od_away - mean(od_away)
+od <- cbind(od_home,od_away)
+colnames(od) <- c("o_home","d_home","o_away","d_away")
+```
+
+### 2.3 O/D Rank
+```{r}
+out_original <- data.frame(o=od_original[,1],d=od_original[,2],rank=rowSums(od_original))
+out_original$ranking <- rank(-out_original$rank)
+#out_original[order(out_original$rank,decreasing=TRUE),]
+out_home <- data.frame(o=od_home[,1],d=od_home[,2],rank=rowSums(od_home))
+out_home$ranking <- rank(-out_home$rank)
+#out_home[order(out_home$rank,decreasing=TRUE),]
+out_away <- data.frame(o=od_away[,1],d=od_away[,2],rank=rowSums(od_away))
+out_away$ranking <- rank(-out_away$rank)
+#out_away[order(out_away$rank,decreasing=TRUE),]
+out <- cbind(out_original$ranking,out_home$ranking,out_away$ranking)
+rownames(out) <- team_names
+colnames(out) <- c("original model","home model","away model")
+out[which(out[,2]-out[,3]<=0),]
+```
+
+### 2.4 Improved O-D Model
+$P_{ijk} = (X_{1}+X_{2}+X_{3})\times e^{o_{ik}-d_{jk}}$ where $X_{1}=48$ if $nOT_{ij}=0$ or $X_{1}=0$ otherwise, $X_{2}=53$ if $nOT_{ij}=1$ or $X_{2}=0$ otherwise, $X_{3}=58$ if $nOT_{ij}=2$ or $X_{3}=0$ otherwise and k is index for representing home or away.
+```{r}
+score <- function(team1,team2,nOT,home_game){
+t1od <- 0
+t2od <- 0
+ifelse(home_game==1,t1od <- od[team1,1]-od[team2,4],t1od <- od[team1,3]-od[team2,2])
+ifelse(home_game==1,t2od <- od[team2,3]-od[team1,2],t2od <- od[team2,1]-od[team1,4])
+ifelse(nOT == 0, x1 <- 48, x1 <- 0)
+ifelse(nOT == 1, x2 <- 53, x2 <- 0)
+ifelse(nOT == 2, x3 <- 58, x3 <- 0)
+t1_pred <- x1*exp(t1od)+x2*exp(t1od)+x3*exp(t1od)
+t2_pred <- x1*exp(t2od)+x2*exp(t2od)+x3*exp(t2od)
+return(c(t1_pred,t2_pred))
+}
+
+# Original model
+score_original <- function(team1,team2){
+t1od <- 0
+t2od <- 0
+t1od <- od_original[team1,1]-od_original[team2,2]
+t2od <- od_original[team2,1]-od_original[team1,2]
+t1_pred <- mean_length*exp(t1od)
+t2_pred <- mean_length*exp(t2od)
+return(c(t1_pred,t2_pred))
+}
+```
+
+
+
+# 3. Negative binomial model
+
+### 3.0 Calculate the residuals 
+```{r}
+# Calculate the residual in the training set
+train_nba$pred_t1 <- 0
+train_nba$pred_t2 <- 0
+for(i in 1:nrow(train_nba)){
+  train_nba[i,]$pred_t1 <- score(train_nba[i,]$team1_name,train_nba[i,]$team2_name,train_nba[i,]$nOT,train_nba[i,]$game_length)[1]
+  train_nba[i,]$pred_t2 <- score(train_nba[i,]$team1_name,train_nba[i,]$team2_name,train_nba[i,]$nOT,train_nba[i,]$game_length)[2]  
+}
+
+# Residuals
+train_nba$residual_t1 <- 0
+train_nba$residual_t2 <- 0
+for(i in 1:nrow(train_nba)){
+  train_nba[i,]$residual_t1 <- train_nba[i,]$team1_score-train_nba[i,]$pred_t1  
+  train_nba[i,]$residual_t2 <- train_nba[i,]$team2_score-train_nba[i,]$pred_t2
+}
+```
+
+### 3.1 Check the overdispersion
+```{r}
+# If the standard deviation(=Pij - P_hat_ij) > sqrt(tij^(oi-dj)), then it means there exists over-dispersion
+# Since our model was generated by the optimization process with block relaxation, I will test over-dispersion manually
+
+# Over-dispersion
+overdis_t1 <- length(which((train_nba$residual_t1)^2>train_nba$pred_t1))
+overdis_t2 <- length(which((train_nba$residual_t2)^2>train_nba$pred_t2))
+overdispersion_trend <- (overdis_t1+overdis_t2)/(nrow(train_nba)*2)
+```
+
+### 3.2 Negative binomial modeling
+```{r}
+# Calculate the theta associated with uncertainty
+theta <- matrix(0, nrow = n_team, ncol = n_team, dimnames = list(team_names, team_names))
+for(i in 1:nrow(train_nba)){
+  if((train_nba[i,]$residual_t1)^2>train_nba[i,]$pred_t1){
+    theta[train_nba[i,]$team1_name,train_nba[i,]$team2_name] <- 
+    ((train_nba[i,]$residual_t1)^2-train_nba[i,]$pred_t1)/(train_nba[i,]$pred_t1)^2}
+  if((train_nba[i,]$residual_t2)^2>train_nba[i,]$pred_t2){
+    theta[train_nba[i,]$team2_name,train_nba[i,]$team1_name] <- 
+    ((train_nba[i,]$residual_t2)^2-train_nba[i,]$pred_t2)/(train_nba[i,]$pred_t2)^2}
+}
+
+# New category
+test_nba1$original_t1 <- 0
+test_nba1$original_t2 <- 0
+test_nba1$nb_t1 <- 0
+test_nba1$nb_t2 <- 0
+```
+
+# 3.3. Result with the mixture of improved Poisson model and Negative binomial model
+```{r}
+# Original and Negative binomial model
+for(j in 1:nrow(test_nba1)){
+t1 <- test_nba1[j,]$team1_name
+t2 <- test_nba1[j,]$team2_name
+OT <- test_nba1[j,]$nOT
+length <- test_nba1[j,]$game_length
+r1 <- 0
+r2 <- 0
+p1 <- 0
+p2 <- 0
+theta1 <- 0
+theta2 <- 0
+s1 <- 0
+s2 <- 0
+nb_value1 <- c(rep(0,150))
+nb_value2 <- c(rep(0,150))
+theta1 <- theta[t1,t2]
+theta2 <- theta[t2,t1]
+s1 <- score(t1,t2,OT,length)[1]
+s2 <- score(t1,t2,OT,length)[2]
+r1 <- ifelse(theta1==0, 0, 1/theta1)
+p1 <- ifelse(theta1==0, 0, 1/(1+theta1*s1))
+r2 <- ifelse(theta2==0, 0, 1/theta2)
+p2 <- ifelse(theta2==0, 0, 1/(1+theta2*s2))
+for(i in 1:length(nb_value1)){
+  nb_value1[i] <- ifelse(r1==0, 0, dnbinom(i,r1,p1))
+}
+for(i in 1:length(nb_value2)){
+  nb_value2[i] <- ifelse(r2==0, 0, dnbinom(i,r2,p2))
+}
+test_nba1[j,]$original_t1 <- s1
+test_nba1[j,]$original_t2 <- s2
+test_nba1[j,]$nb_t1 <- ifelse(theta1==0, s1, which.max(nb_value1))
+test_nba1[j,]$nb_t2 <- ifelse(theta2==0, s2, which.max(nb_value2))
+}
+
+# MAE
+pred_original <- matrix(0,nrow=nrow(test_nba1),ncol=2)
+for(i in 1:nrow(test_nba1)){
+pred_original[i,1] <- score_original(test_nba1[i,]$team1_name,test_nba1[i,]$team2_name)[1]
+pred_original[i,2] <- score_original(test_nba1[i,]$team1_name,test_nba1[i,]$team2_name)[2]
+}
+pred_error_abs_original <- as.matrix(abs(c(test_nba1$team1_score-pred_original[,1],test_nba1$team2_score-pred_original[,2])))
+pred_error_original <- as.matrix(c(test_nba1$team1_score-pred_original[,1],test_nba1$team2_score-pred_original[,2]))
+MAE_original <- mean(pred_error_abs_original)
+
+pred_error_nb <- as.matrix(c(test_nba1$team1_score-test_nba1$nb_t1,test_nba1$team2_score-test_nba1$nb_t2)) 
+pred_error_abs_nb <- as.matrix(abs(c(test_nba1$team1_score-test_nba1$nb_t1,test_nba1$team2_score-test_nba1$nb_t2)))
+MAE_nb <- mean(pred_error_abs_nb)
+
+MAE_original
+MAE_nb
+```
+
+
+
+# 4. Quarter effect
+In Poisson distribution, $\lambda =\lambda _{1}+\lambda _{2}+\lambda _{3}+\lambda _{4}+\lambda _{OT}$, so Quarter effect doesn't affect the total score. However, our team wants to check the assumption "Coach may use different player line-up and strategy for each quarter" = "Different o/d value".
+```{r}
+quarter_score <- as.data.frame(fread("Quarterscore.csv"))
+nba$team1_score_q1 <- quarter_score$T1_Q1
+nba$team1_score_q2 <- quarter_score$T1_Q2
+nba$team1_score_q3 <- quarter_score$T1_Q3
+nba$team1_score_q4 <- quarter_score$T1_Q4
+nba$team2_score_q1 <- quarter_score$T2_Q1
+nba$team2_score_q2 <- quarter_score$T2_Q2
+nba$team2_score_q3 <- quarter_score$T2_Q3
+nba$team2_score_q4 <- quarter_score$T2_Q4
+train_nba_q <- nba[ran,]
+train_nba_q <- train_nba_q[,-c(2,4)]
+train_nba_q$game_length <- 12
+train_nba_q_home <- train_nba_q[which(train_nba_q$home_game == "1"),]
+train_nba_q_away <- train_nba_q[which(train_nba_q$home_game == "0"),]
+od_q_home <- as.matrix(od_home[,-2])
+od_q_away <- as.matrix(od_away[,-2])
+
+# Optimization for each quarter
+for(k in 7:10){
+a <- c(1,2,3,4,5,k,k+4)
+train_nba_home <- train_nba_q_home[,a]
+train_nba_away <- train_nba_q_away[,a]
+colnames(train_nba_home) <- c("team1_name", "team2_name", "location", "nOT", "game_length", "team1_score", "team2_score")
+colnames(train_nba_away) <- c("team1_name", "team2_name", "location", "nOT", "game_length", "team1_score", "team2_score")
+T_home <- matrix(0, nrow = n_team, ncol = n_team, dimnames = list(team_names, team_names))
+P_home <- matrix(0, nrow = n_team, ncol = n_team, dimnames = list(team_names, team_names))
+T_away <- matrix(0, nrow = n_team, ncol = n_team, dimnames = list(team_names, team_names))
+P_away <- matrix(0, nrow = n_team, ncol = n_team, dimnames = list(team_names, team_names))
+for(i in 1:nrow(T_home)){
+    out1 <- subset(train_nba_home,team1_name==rownames(T_home)[i],select=c("team2_name","team1_score","team2_score","game_length"))
+    mins <- tapply(out1[,4],out1[,1],sum)
+    ps <- tapply(out1[,2],out1[,1],sum)
+    pg <- tapply(out1[,3],out1[,1],sum)
+    T_home[i,names(mins)] <- mins
+    P_home[i,names(ps)] <- P_home[i,names(ps)] + ps
+    P_home[names(ps),i] <- P_home[names(ps),i] + pg
+}
+T_home <- T_home + t(T_home) 
+Prs_home <- rowSums(P_home) 
+Pcs_home <- colSums(P_home)
+for(i in 1:nrow(T_away)){
+    out2 <- subset(train_nba_away,team1_name==rownames(T_away)[i],select=c("team2_name","team1_score","team2_score","game_length"))
+    mins <- tapply(out2[,4],out2[,1],sum)
+    ps <- tapply(out2[,2],out2[,1],sum)
+    pg <- tapply(out2[,3],out2[,1],sum)
+    T_away[i,names(mins)] <- mins
+    P_away[i,names(ps)] <- P_away[i,names(ps)] + ps
+    P_away[names(ps),i] <- P_away[names(ps),i] + pg
+}
+T_away <- T_away + t(T_away) 
+Prs_away <- rowSums(P_away) 
+Pcs_away <- colSums(P_away)
+od_home <- matrix(0,nrow=n_team,ncol=2)
+colnames(od_home) <- c("o","d")
+rownames(od_home) <- colnames(T_home)
+for(j in 1:Niter){
+    od_home[,2] <- -log(Pcs_home / colSums(T_home*exp(od_home[,1])))
+    od_home[,2] <- od_home[,2] - od_home[1,2]
+    od_home[,1] <- log(Prs_home / colSums(t(T_home)*exp(-od_home[,2])))
+}
+od_home <- od_home - mean(od_home)
+od_away <- matrix(0,nrow=n_team,ncol=2)
+colnames(od_away) <- c("o","d")
+rownames(od_away) <- colnames(T_away)
+for(j in 1:Niter){
+    od_away[,2] <- -log(Pcs_away / colSums(T_away*exp(od_away[,1])))
+    od_away[,2] <- od_away[,2] - od_away[1,2]
+    od_away[,1] <- log(Prs_away / colSums(t(T_away)*exp(-od_away[,2])))
+}
+od_away <- od_away - mean(od_away)
+od_q_home <- cbind(od_q_home,od_home)
+od_q_away <- cbind(od_q_away,od_away)
+}
+od_q_home <- od_q_home[,-1]
+od_q_away <- od_q_away[,-1]
+colnames(od_q_home) <- c("o_q1","d_q1","o_q2","d_q2","o_q3","d_q3","o_q4","d_q4")
+colnames(od_q_away) <- c("o_q1","d_q1","o_q2","d_q2","o_q3","d_q3","o_q4","d_q4")
+## mean_length : 12 in each quarter as NBA rule
+```
+
+
